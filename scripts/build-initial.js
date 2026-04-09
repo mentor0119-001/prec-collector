@@ -25,15 +25,23 @@ async function uploadGzip(key, payload) {
   console.log(`✅ R2 업로드: ${key} (${(gzipped.length/1024).toFixed(1)}KB gzip)`);
 }
 
-async function fetchPage(page, dateRange) {
+async function fetchPage(page, dateRange, retries = 3) {
   const url = `https://www.law.go.kr/DRF/lawSearch.do`
     + `?OC=${process.env.LAW_OC_KEY}&target=prec&type=JSON`
     + `&display=100&page=${page}&prncYd=${dateRange}&sort=date`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  const raw = data?.PrecSearch?.prec;
-  return !raw ? [] : Array.isArray(raw) ? raw : [raw];
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const raw = data?.PrecSearch?.prec;
+      return !raw ? [] : Array.isArray(raw) ? raw : [raw];
+    } catch (e) {
+      console.log(`  ⚠ p.${page} attempt ${attempt}/${retries} failed: ${e.message}`);
+      if (attempt === retries) throw e;
+      await new Promise(r => setTimeout(r, 5000 * attempt));
+    }
+  }
 }
 
 async function main() {

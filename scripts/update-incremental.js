@@ -43,8 +43,18 @@ async function collectRange(fromDate, toDate) {
       + `?OC=${process.env.LAW_OC_KEY}&target=prec&type=JSON`
       + `&display=100&page=${page}&prncYd=${fromDate}~${toDate}&sort=date`;
 
-    const res  = await fetch(url);
-    const data = await res.json();
+    let data;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+        data = await res.json();
+        break;
+      } catch (e) {
+        console.log(`  ⚠ p.${page} attempt ${attempt}/3 failed: ${e.message}`);
+        if (attempt === 3) throw e;
+        await new Promise(r => setTimeout(r, 5000 * attempt));
+      }
+    }
     const raw  = data?.PrecSearch?.prec;
     const hits = !raw ? [] : Array.isArray(raw) ? raw : [raw];
 
