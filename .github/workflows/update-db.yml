@@ -1,0 +1,61 @@
+name: 판례 DB 자동 갱신
+
+on:
+  schedule:
+    # UTC 15:00 = KST 00:00 (자정)
+    - cron: '0 15 * * *'
+
+  # 수동 실행 (앱의 수집관리 탭에서 트리거)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '실행 모드'
+        required: true
+        default: 'incremental'
+        type: choice
+        options:
+          - incremental
+          - full
+
+jobs:
+  update-prec-db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: 수집 실행
+        run: |
+          MODE="${{ github.event.inputs.mode || 'incremental' }}"
+          if [ "$MODE" = "full" ]; then
+            echo "🔄 전체 재수집 시작"
+            node scripts/build-initial.js
+          else
+            echo "⚡ 증분 수집 시작"
+            node scripts/update-incremental.js
+          fi
+        env:
+          LAW_OC_KEY:    ${{ secrets.LAW_OC_KEY }}
+          R2_ENDPOINT:   ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET:     ${{ secrets.R2_BUCKET }}
+
+      - name: 실행 결과 요약
+        if: always()
+        run: |
+          echo "## 판례 DB 갱신 결과" >> $GITHUB_STEP_SUMMARY
+          echo "- 실행 시각: $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- 모드: ${{ github.event.inputs.mode || 'incremental' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 상태: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY

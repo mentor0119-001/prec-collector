@@ -1,0 +1,13 @@
+{
+  "name": "prec-collector",
+  "version": "1.0.0",
+  "description": "법제처 판례 DB 자동 수집 → Cloudflare R2",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-initial.js",
+    "update": "node scripts/update-incremental.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0"
+  }
+}
