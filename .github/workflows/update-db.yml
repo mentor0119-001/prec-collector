@@ -2,25 +2,30 @@ name: 판례 DB 자동 갱신
 
 on:
   schedule:
-    # UTC 15:00 = KST 00:00 (자정)
-    - cron: '0 15 * * *'
+    # ── 판례 전용 증분 (KST 기준): 06:00, 12:00, 18:00, 00:00 → 하루 4회
+    # UTC 기준: 21:00(전날), 03:00, 09:00, 15:00
+    - cron: '0 21 * * *'   # KST 06:00
+    - cron: '0 3  * * *'   # KST 12:00
+    - cron: '0 9  * * *'   # KST 18:00
+    - cron: '0 15 * * *'   # KST 00:00 (자정 — 이 회차만 법령·행정규칙도 수집)
 
-  # 수동 실행 (앱의 수집관리 탭에서 트리거)
+  # 수동 실행
   workflow_dispatch:
     inputs:
       mode:
         description: '실행 모드'
         required: true
-        default: 'incremental'
+        default: 'prec-only'
         type: choice
         options:
-          - incremental
-          - full
+          - prec-only   # 판례 + 전원합의체 증분만 (빠름, ~5분)
+          - full-daily  # 판례 + 법령 + 행정규칙 + 전원합의체 (하루 1회용, ~30분)
+          - rebuild     # 전체 DB 재구축 (build-initial.js, 수시간)
 
 jobs:
   update-prec-db:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -35,15 +40,33 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: 실행 모드 결정
+        id: decide-mode
+        run: |
+          # 수동 실행이면 입력값 사용
+          if [ -n "${{ github.event.inputs.mode }}" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          # cron 15:00 UTC (KST 00:00 자정)이면 full-daily
+          elif [ "$(date -u +%H)" = "15" ]; then
+            echo "mode=full-daily" >> $GITHUB_OUTPUT
+          # 나머지 시간대 cron이면 prec-only
+          else
+            echo "mode=prec-only" >> $GITHUB_OUTPUT
+          fi
+
       - name: 수집 실행
         run: |
-          MODE="${{ github.event.inputs.mode || 'incremental' }}"
-          if [ "$MODE" = "full" ]; then
-            echo "🔄 전체 재수집 시작"
+          MODE="${{ steps.decide-mode.outputs.mode }}"
+          echo "실행 모드: $MODE"
+          if [ "$MODE" = "rebuild" ]; then
+            echo "전체 DB 재구축 시작"
             node scripts/build-initial.js
+          elif [ "$MODE" = "full-daily" ]; then
+            echo "일별 전체 수집 시작 (판례+법령+행정규칙+전원합의체)"
+            node scripts/update-incremental.js --full-daily
           else
-            echo "⚡ 증분 수집 시작"
-            node scripts/update-incremental.js
+            echo "판례 증분 수집 시작 (prec-only)"
+            node scripts/update-incremental.js --prec-only
           fi
         env:
           LAW_OC_KEY:    ${{ secrets.LAW_OC_KEY }}
@@ -57,5 +80,5 @@ jobs:
         run: |
           echo "## 판례 DB 갱신 결과" >> $GITHUB_STEP_SUMMARY
           echo "- 실행 시각: $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "- 모드: ${{ github.event.inputs.mode || 'incremental' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 모드: ${{ steps.decide-mode.outputs.mode }}" >> $GITHUB_STEP_SUMMARY
           echo "- 상태: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
