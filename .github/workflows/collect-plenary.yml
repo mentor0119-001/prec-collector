@@ -1,0 +1,45 @@
+name: 전원합의체 초기 수집
+
+on:
+  # 수동 실행 전용 — 최초 1회 또는 재구축 시
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: '실행 사유 (예: 최초구축, 재수집)'
+        required: false
+        default: '최초 전체 수집'
+
+jobs:
+  collect-plenary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6시간 — 전기간 스캔 + detail call 수천 건
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: 전원합의체 전체 수집
+        run: node scripts/collect-plenary-full.js
+        env:
+          LAW_OC_KEY:    ${{ secrets.LAW_OC_KEY }}
+          R2_ENDPOINT:   ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET:     ${{ secrets.R2_BUCKET }}
+
+      - name: 실행 결과 요약
+        if: always()
+        run: |
+          echo "## 전원합의체 수집 결과" >> $GITHUB_STEP_SUMMARY
+          echo "- 실행 시각: $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- 사유: ${{ github.event.inputs.memo }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 상태: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
