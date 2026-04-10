@@ -1,0 +1,192 @@
+name: 수집 Watchdog — 실패 시 자동 재시작
+
+on:
+  # ── 실패/타임아웃 감지: update-db 워크플로우 완료 후 트리거
+  workflow_run:
+    workflows:
+      - "판례 DB 자동 갱신"
+      - "전원합의체 초기 수집"
+    types:
+      - completed
+
+  # ── 보조 스케줄: 6시간마다 마지막 실행 상태 직접 점검
+  # (workflow_run이 missed되는 엣지케이스 대비)
+  schedule:
+    - cron: '30 0,6,12,18 * * *'   # KST 09:30, 15:30, 21:30, 03:30
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '재시작 대상'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto        # 마지막 실패 워크플로우 감지 후 재시작
+          - update-db   # update-db.yml 강제 재시작
+          - plenary     # collect-plenary.yml 강제 재시작
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      actions: write   # workflow dispatch 트리거에 필요
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Case 1: workflow_run 이벤트 — 실패한 워크플로우 즉시 재시작
+      - name: workflow_run 실패 감지 및 재시작
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WF_NAME="${{ github.event.workflow_run.name }}"
+          WF_CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+          WF_ID="${{ github.event.workflow_run.id }}"
+
+          echo "트리거 워크플로우: $WF_NAME"
+          echo "결론: $WF_CONCLUSION"
+          echo "Run ID: $WF_ID"
+
+          # 성공이면 watchdog 불필요
+          if [ "$WF_CONCLUSION" = "success" ]; then
+            echo "✅ 정상 완료 — 재시작 불필요"
+            exit 0
+          fi
+
+          echo "⚠ 실패/타임아웃 감지: $WF_CONCLUSION — 5분 후 재시작 시도"
+          sleep 300   # 5분 대기 (API 쿨다운)
+
+          # 워크플로우 파일명 결정
+          if [ "$WF_NAME" = "판례 DB 자동 갱신" ]; then
+            WF_FILE="update-db.yml"
+            INPUTS='{"mode":"prec-only"}'
+            echo "→ update-db.yml (prec-only) 재시작"
+          elif [ "$WF_NAME" = "전원합의체 초기 수집" ]; then
+            WF_FILE="collect-plenary.yml"
+            INPUTS='{"memo":"watchdog 자동 재시작"}'
+            echo "→ collect-plenary.yml 재시작 (중간저장에서 이어받기)"
+          else
+            echo "알 수 없는 워크플로우: $WF_NAME — 스킵"
+            exit 0
+          fi
+
+          gh workflow run "$WF_FILE" \
+            --repo "${{ github.repository }}" \
+            --field "$(echo $INPUTS | jq -r 'to_entries[] | "\(.key)=\(.value)"')" \
+            || gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                /repos/${{ github.repository }}/actions/workflows/$WF_FILE/dispatches \
+                -f ref=main \
+                -f "inputs=$(echo $INPUTS)"
+
+          echo "✅ 재시작 요청 완료"
+
+      # ── Case 2: schedule — 마지막 실행 상태 점검
+      - name: 스케줄 점검 — 최근 실패 워크플로우 감지
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[스케줄 Watchdog] 마지막 수집 실행 상태 점검..."
+
+          check_and_restart() {
+            local WF_FILE="$1"
+            local WF_INPUTS="$2"
+            local LABEL="$3"
+
+            # 최근 실행 1개 조회
+            LAST=$(gh run list \
+              --workflow="$WF_FILE" \
+              --repo "${{ github.repository }}" \
+              --limit 1 \
+              --json conclusion,createdAt,status \
+              --jq '.[0]')
+
+            STATUS=$(echo "$LAST" | jq -r '.status // "unknown"')
+            CONCLUSION=$(echo "$LAST" | jq -r '.conclusion // "none"')
+            CREATED=$(echo "$LAST" | jq -r '.createdAt // ""')
+
+            echo "[$LABEL] status=$STATUS conclusion=$CONCLUSION created=$CREATED"
+
+            # 실패/타임아웃 상태이면 재시작
+            if [ "$CONCLUSION" = "failure" ] || [ "$CONCLUSION" = "timed_out" ]; then
+              echo "⚠ [$LABEL] 마지막 실행 실패 — 재시작 시도"
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                /repos/${{ github.repository }}/actions/workflows/$WF_FILE/dispatches \
+                -f ref=main \
+                -f "inputs=$WF_INPUTS"
+              echo "✅ [$LABEL] 재시작 요청 완료"
+            elif [ "$STATUS" = "in_progress" ] || [ "$STATUS" = "queued" ]; then
+              echo "▶ [$LABEL] 현재 실행 중 — 스킵"
+            else
+              echo "✅ [$LABEL] 정상 상태 ($CONCLUSION)"
+            fi
+          }
+
+          check_and_restart "update-db.yml"        '{"mode":"prec-only"}'            "판례 DB"
+          check_and_restart "collect-plenary.yml"  '{"memo":"watchdog 자동 재시작"}' "전원합의체"
+
+      # ── Case 3: 수동 트리거
+      - name: 수동 재시작
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ github.event.inputs.target }}
+        run: |
+          echo "수동 재시작 요청: $TARGET"
+
+          dispatch() {
+            local WF_FILE="$1"
+            local INPUTS="$2"
+            echo "→ $WF_FILE 디스패치"
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              /repos/${{ github.repository }}/actions/workflows/$WF_FILE/dispatches \
+              -f ref=main \
+              -f "inputs=$INPUTS"
+          }
+
+          if [ "$TARGET" = "update-db" ]; then
+            dispatch "update-db.yml" '{"mode":"prec-only"}'
+          elif [ "$TARGET" = "plenary" ]; then
+            dispatch "collect-plenary.yml" '{"memo":"수동 재시작"}'
+          else
+            # auto: 양쪽 모두 마지막 상태 확인 후 실패만 재시작
+            for WF in update-db.yml collect-plenary.yml; do
+              CONCLUSION=$(gh run list \
+                --workflow="$WF" \
+                --repo "${{ github.repository }}" \
+                --limit 1 \
+                --json conclusion \
+                --jq '.[0].conclusion // "none"')
+              echo "$WF: $CONCLUSION"
+              if [ "$CONCLUSION" = "failure" ] || [ "$CONCLUSION" = "timed_out" ]; then
+                if [ "$WF" = "update-db.yml" ]; then
+                  dispatch "update-db.yml" '{"mode":"prec-only"}'
+                else
+                  dispatch "collect-plenary.yml" '{"memo":"watchdog 수동 재시작"}'
+                fi
+              fi
+            done
+          fi
+
+      # ── 실행 결과 요약
+      - name: 결과 요약
+        if: always()
+        run: |
+          echo "## Watchdog 실행 결과" >> $GITHUB_STEP_SUMMARY
+          echo "- 실행 시각: $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- 트리거: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "- 감지 워크플로우: ${{ github.event.workflow_run.name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- 결론: ${{ github.event.workflow_run.conclusion }}" >> $GITHUB_STEP_SUMMARY
+          fi
