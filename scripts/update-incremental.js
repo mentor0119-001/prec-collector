@@ -288,29 +288,52 @@ async function updatePlenary(toDate) {
 
 /* ══════════════════════════════════════
    메인
+   --prec-only  : 판례 + 전원합의체 증분만 (빠름 ~3분, API ~5회)
+   --full-daily : 판례 + 법령 + 행정규칙 + 전원합의체 (하루 1회, ~30분, API ~300회)
+   (인자 없음)  : full-daily와 동일 (하위 호환)
    ══════════════════════════════════════ */
 async function main() {
-  console.log('[증분 수집 시작]', new Date().toISOString());
+  const isPrecOnly = process.argv.includes('--prec-only');
+  const mode = isPrecOnly ? 'prec-only' : 'full-daily';
+  console.log(`[증분 수집 시작] mode=${mode}`, new Date().toISOString());
   const toDate = toApiDate(new Date());
 
-  const prec    = await updatePrec(toDate);
-  const law     = await updateLaw(toDate);
-  const admrul  = await updateAdmrul(toDate);
+  // 판례 증분은 항상 실행
+  const prec = await updatePrec(toDate);
+
+  // 전원합의체 증분은 항상 실행 (빠름 — 날짜 필터 적용 시 2 API call)
   const plenary = await updatePlenary(toDate);
 
-  // 통합 meta 업데이트
+  let law    = null;
+  let admrul = null;
+
+  if (!isPrecOnly) {
+    // 법령 + 행정규칙은 full-daily에서만 (변경 빈도 낮음 — 하루 1회 충분)
+    law    = await updateLaw(toDate);
+    admrul = await updateAdmrul(toDate);
+  } else {
+    console.log('\n── 법령·행정규칙 스킵 (prec-only 모드) ──');
+  }
+
+  // 통합 meta 업데이트 (prec-only 모드에서는 법령·행정규칙 카운트 기존값 유지)
+  let prevMeta = {};
+  try { prevMeta = await downloadFromR2('all/v1/meta.json'); } catch {}
+
   await uploadToR2('all/v1/meta.json', {
-    lastUpdated: toDate, updatedAt: Date.now(),
-    prec: prec.count, law: law.count, admrul: admrul.count, plenary: plenary.count,
-    total: prec.count + law.count + admrul.count,
+    lastUpdated: toDate,
+    updatedAt: Date.now(),
+    prec:    prec.count,
+    law:     law    ? law.count    : (prevMeta.law    || 0),
+    admrul:  admrul ? admrul.count : (prevMeta.admrul || 0),
+    plenary: plenary.count,
+    total:   prec.count + (law ? law.count : (prevMeta.law||0)) + (admrul ? admrul.count : (prevMeta.admrul||0)),
   });
 
-  console.log('\n✅ 증분 수집 완료');
+  console.log(`\n✅ 수집 완료 [${mode}]`);
   console.log(`  판례:       ${prec.count.toLocaleString()}건 (+${prec.added})`);
-  console.log(`  법령:       ${law.count.toLocaleString()}건`);
-  console.log(`  행정규칙:   ${admrul.count.toLocaleString()}건`);
+  if (law)    console.log(`  법령:       ${law.count.toLocaleString()}건`);
+  if (admrul) console.log(`  행정규칙:   ${admrul.count.toLocaleString()}건`);
   console.log(`  전원합의체: ${plenary.count}건 (+${plenary.added})`);
-  console.log(`  총계:       ${(prec.count + law.count + admrul.count).toLocaleString()}건`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
