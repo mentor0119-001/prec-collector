@@ -1,6 +1,6 @@
 // scripts/update-incremental.js
 // 실행: GitHub Actions cron (매일 KST 00:00)
-// 용도: 신규 판례 + 법령 + 행정규칙 증분 수집 → 기존 DB 병합 → R2 덮어쓰기
+// 용도: 신규 판례 + 법령 + 행정규칙 + 전원합의체 증분 수집 → 기존 DB 병합 → R2 덮어쓰기
 
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { gzipSync, gunzipSync } from 'zlib';
@@ -186,56 +186,66 @@ async function updateAdmrul(toDate) {
   return { count };
 }
 
-
 /* ══════════════════════════════════════
    4. 전원합의체 판결 증분 수집
+   - lastUpdated 없으면: 전체 역사 스캔 (최초 실행 — 수십년 분량 수집)
+   - lastUpdated 있으면: 해당 날짜 이후만 스캔 (일별 증분 — 수 페이지)
    ══════════════════════════════════════ */
 async function updatePlenary(toDate) {
-  console.log('
-── 전원합의체 판결 증분 수집 ──');
+  console.log('\n── 전원합의체 판결 증분 수집 ──');
 
-  // 기존 plenary.json 로드
-  let existing = { list: [] };
+  // 기존 plenary.json 로드 (plain JSON, not gzip)
+  let existing = { list: [], lastUpdated: null };
   try {
     const res = await s3.send(new GetObjectCommand({ Bucket: process.env.R2_BUCKET, Key: 'prec/plenary.json' }));
     const buf = Buffer.from(await res.Body.transformToByteArray());
     existing = JSON.parse(buf.toString('utf-8'));
-  } catch { /* 없으면 빈 목록 */ }
-  const existingNums = new Set(existing.list.map(p => p.caseNum));
-  console.log(`  기존: ${existingNums.size}건`);
+  } catch { /* 없으면 빈 목록 — 전체 스캔 */ }
+  const existingNums = new Set((existing.list || []).map(p => p.caseNum));
+  const lastDate = existing.lastUpdated || null;
+  console.log(`  기존: ${existingNums.size}건, lastUpdated: ${lastDate || '없음(전체스캔)'}`);
 
-  // 법제처 전문검색 — 대법원 판결 중 "전원합의체" 포함
+  // 날짜 필터: lastUpdated 있으면 증분, 없으면 전체 역사 스캔
+  const dateFilter = lastDate ? `&prncYd=${lastDate}~${toDate}` : '';
+  if (dateFilter) console.log(`  날짜필터: ${lastDate}~${toDate}`);
+  else console.log(`  날짜필터 없음 — 전기간 스캔 (수백 페이지 소요)`);
+
+  // 법제처 전문검색 — "전원합의체" 포함 대법원 판결
+  const ENC_QUERY = encodeURIComponent('전원합의체');
+  const ENC_COURT = encodeURIComponent('대법원');
   const newCases = [];
   let page = 1;
   while (true) {
     const url = `https://www.law.go.kr/DRF/lawSearch.do`
       + `?OC=${process.env.LAW_OC_KEY}&target=prec&type=JSON`
-      + `&search=2&query=%EC%A0%84%EC%9B%90%ED%95%A9%EC%9D%98%EC%B2%B4&display=100&page=${page}&courtNm=%EB%8C%80%EB%B2%95%EC%9B%90`;
+      + `&search=2&query=${ENC_QUERY}&display=100&page=${page}&courtNm=${ENC_COURT}${dateFilter}`;
     const data = await apiFetch(url);
     const raw = data?.PrecSearch?.prec;
     const hits = !raw ? [] : Array.isArray(raw) ? raw : [raw];
     if (!hits.length) break;
 
     for (const p of hits) {
-      const caseNum = (p.사건번호 || '').replace(/s+/g, '');
+      const caseNum = (p.사건번호 || '').replace(/\s+/g, '');
       if (!caseNum || existingNums.has(caseNum)) continue;
 
-      // 상세 조회 — 실제 전원합의체 판결인지 확인
+      // 상세 조회 — 실제 전원합의체 판결인지 본문으로 검증
       await new Promise(r => setTimeout(r, 200));
-      const detail = await apiFetch(
-        `https://www.law.go.kr/DRF/lawService.do?OC=${process.env.LAW_OC_KEY}&target=prec&ID=${p.판례일련번호}&type=JSON`
-      );
+      let detail;
+      try {
+        detail = await apiFetch(
+          `https://www.law.go.kr/DRF/lawService.do?OC=${process.env.LAW_OC_KEY}&target=prec&ID=${p.판례일련번호}&type=JSON`
+        );
+      } catch (e) { console.log(`  상세조회 실패 ${caseNum}: ${e.message}`); continue; }
       const d = detail?.PrecService;
       if (!d) continue;
       const content = d.판례내용 || '';
-      // 인용 판결 제외 — 본문에 "전원합의체 판결"이 직접 선고된 경우만
-      const isPlenary = /전원합의체.*선고|선고.*전원합의체|전원합의체[s가-힣]*(판결|결정)/.test(content.slice(0, 500))
+      // 인용 판결 제외 — 실제 전원합의체로 선고된 경우만
+      const isPlenary = /전원합의체.*선고|선고.*전원합의체|전원합의체[\s가-힣]*(판결|결정)/.test(content.slice(0, 500))
         || (d.선고 || '').includes('전원합의체');
       if (!isPlenary) continue;
 
-      const dateRaw = (d.선고일자 || '').replace(/./g, '');
-      const laws = (d.참조조문 || '').split(/[,、
-]+/).map(s => s.trim()).filter(s => s.length > 1).slice(0, 8);
+      const dateRaw = (d.선고일자 || '').replace(/\./g, '');
+      const laws = (d.참조조문 || '').split(/[,、\n]+/).map(s => s.trim()).filter(s => s.length > 1).slice(0, 8);
       const changed = /변경|파기|종전.*변경|판례.*변경/.test(content);
 
       newCases.push({
@@ -253,27 +263,21 @@ async function updatePlenary(toDate) {
       console.log(`  + ${caseNum} (${dateRaw}) ${changed ? '[법리변경]' : ''}`);
     }
     page++;
-    if (page % 10 === 0) console.log(`  페이지 ${page}/${Math.ceil(6818/100)}...`);
+    if (page % 10 === 0) console.log(`  페이지 ${page} 처리중...`);
     await new Promise(r => setTimeout(r, 400));
   }
 
-  if (newCases.length === 0) {
-    console.log('  신규 전원합의체 없음');
-    return { count: existingNums.size, added: 0 };
-  }
-
-  const merged = [...existing.list, ...newCases];
+  // 신규 없어도 lastUpdated 항상 갱신
+  const merged = [...(existing.list || []), ...newCases];
   merged.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 
-  // plenary.json은 plain JSON (앱에서 직접 fetch, gzip 없음)
-  const { PutObjectCommand: PutCmd } = await import('@aws-sdk/client-s3');
-  await s3.send(new PutCmd({
+  await s3.send(new PutObjectCommand({
     Bucket: process.env.R2_BUCKET, Key: 'prec/plenary.json',
-    Body: JSON.stringify({ list: merged }),
+    Body: JSON.stringify({ list: merged, lastUpdated: toDate, updatedAt: Date.now() }),
     ContentType: 'application/json',
     CacheControl: 'public, s-maxage=3600, stale-while-revalidate=600',
   }));
-  console.log(`  전원합의체: +${newCases.length} = ${merged.length}건`);
+  console.log(`  전원합의체: +${newCases.length} = ${merged.length}건 (lastUpdated: ${toDate})`);
   return { count: merged.length, added: newCases.length };
 }
 
@@ -292,15 +296,16 @@ async function main() {
   // 통합 meta 업데이트
   await uploadToR2('all/v1/meta.json', {
     lastUpdated: toDate, updatedAt: Date.now(),
-    prec: prec.count, law: law.count, admrul: admrul.count,
+    prec: prec.count, law: law.count, admrul: admrul.count, plenary: plenary.count,
     total: prec.count + law.count + admrul.count,
   });
 
-  console.log(`\n✅ 증분 수집 완료`);
-  console.log(`  판례:     ${prec.count.toLocaleString()}건 (+${prec.added})`);
-  console.log(`  법령:     ${law.count.toLocaleString()}건`);
-  console.log(`  행정규칙: ${admrul.count.toLocaleString()}건`);
-  console.log(`  총계:     ${(prec.count + law.count + admrul.count).toLocaleString()}건`);
+  console.log('\n✅ 증분 수집 완료');
+  console.log(`  판례:       ${prec.count.toLocaleString()}건 (+${prec.added})`);
+  console.log(`  법령:       ${law.count.toLocaleString()}건`);
+  console.log(`  행정규칙:   ${admrul.count.toLocaleString()}건`);
+  console.log(`  전원합의체: ${plenary.count}건 (+${plenary.added})`);
+  console.log(`  총계:       ${(prec.count + law.count + admrul.count).toLocaleString()}건`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
