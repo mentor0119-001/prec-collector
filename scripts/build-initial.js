@@ -1,6 +1,6 @@
 // scripts/build-initial.js
-// 실행: node --env-file=.env scripts/build-initial.js
-// 용도: 서비스 첫 배포 전 전체 DB 구축 — 판례 + 법령 + 행정규칙
+// 실행: GitHub Actions workflow_dispatch (mode=full) 또는 node --env-file=.env scripts/build-initial.js
+// 용도: 서비스 첫 배포 전 전체 DB 구축 — 판례 + 법령 + 행정규칙 + 전원합의체
 
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { gzipSync } from 'zlib';
@@ -109,7 +109,6 @@ const LAW_TYPE_MAP = {
 };
 function lawTypeToId(name) {
   if (LAW_TYPE_MAP[name] !== undefined) return LAW_TYPE_MAP[name];
-  // "행정안전부령" 등은 부령(4)
   if (name.includes('령') && !name.includes('대통령')) return 4;
   return 9;
 }
@@ -134,7 +133,6 @@ async function collectLaw() {
       const dateNum = parseInt((l.시행일자 || '').replace(/[^0-9]/g, ''), 10) || 0;
       const typeId = lawTypeToId(l.법령구분명 || '');
       const mst = parseInt(l.법령일련번호 || '0', 10) || 0;
-      // key: 법령명, value: [법령구분코드, 시행일자, 법령일련번호]
       db[name] = [typeId, dateNum, mst];
     }
 
@@ -180,7 +178,6 @@ async function collectAdmrul() {
       const dateNum = parseInt((a.시행일자 || '').replace(/[^0-9]/g, ''), 10) || 0;
       const typeId = admrulTypeToId(a.행정규칙종류 || '');
       const serial = parseInt(a.행정규칙일련번호 || '0', 10) || 0;
-      // key: 행정규칙명, value: [종류코드, 시행일자, 일련번호]
       db[name] = [typeId, dateNum, serial];
     }
 
@@ -196,7 +193,85 @@ async function collectAdmrul() {
 }
 
 /* ══════════════════════════════════════
-   메인 — 3종 전체 수집 + R2 업로드
+   4. 전원합의체 (plenary) 전체 수집
+   — 법제처 전문검색: "전원합의체" 포함 대법원 판결 전체
+   — plain JSON 업로드 (앱에서 직접 fetch, gzip 없음)
+   ══════════════════════════════════════ */
+async function collectPlenary(todayStr) {
+  console.log('\n═══ 전원합의체 전체 수집 시작 ═══');
+
+  const ENC_QUERY = encodeURIComponent('전원합의체');
+  const ENC_COURT = encodeURIComponent('대법원');
+  const cases = [];
+  const seenNums = new Set();
+  let page = 1;
+
+  while (true) {
+    const url = `https://www.law.go.kr/DRF/lawSearch.do`
+      + `?OC=${process.env.LAW_OC_KEY}&target=prec&type=JSON`
+      + `&search=2&query=${ENC_QUERY}&display=100&page=${page}&courtNm=${ENC_COURT}`;
+    const data = await apiFetch(url);
+    const raw = data?.PrecSearch?.prec;
+    const hits = !raw ? [] : Array.isArray(raw) ? raw : [raw];
+    if (!hits.length) break;
+
+    for (const p of hits) {
+      const caseNum = (p.사건번호 || '').replace(/\s+/g, '');
+      if (!caseNum || seenNums.has(caseNum)) continue;
+
+      await new Promise(r => setTimeout(r, 200));
+      let detail;
+      try {
+        detail = await apiFetch(
+          `https://www.law.go.kr/DRF/lawService.do?OC=${process.env.LAW_OC_KEY}&target=prec&ID=${p.판례일련번호}&type=JSON`
+        );
+      } catch (e) { console.log(`  상세조회 실패 ${caseNum}: ${e.message}`); continue; }
+      const d = detail?.PrecService;
+      if (!d) continue;
+      const content = d.판례내용 || '';
+      // 인용 판결 제외 — 실제 전원합의체로 선고된 경우만
+      const isPlenary = /전원합의체.*선고|선고.*전원합의체|전원합의체[\s가-힣]*(판결|결정)/.test(content.slice(0, 500))
+        || (d.선고 || '').includes('전원합의체');
+      if (!isPlenary) continue;
+
+      const dateRaw = (d.선고일자 || '').replace(/\./g, '');
+      const laws = (d.참조조문 || '').split(/[,、\n]+/).map(s => s.trim()).filter(s => s.length > 1).slice(0, 8);
+      const changed = /변경|파기|종전.*변경|판례.*변경/.test(content);
+
+      cases.push({
+        caseNum,
+        date: dateRaw,
+        court: d.법원명 || '대법원',
+        subject: d.사건명 || '',
+        overrules: changed,
+        oldRule: '', newRule: '',
+        keywords: [],
+        laws,
+        casenoteUrl: `https://casenote.kr/${encodeURIComponent(d.법원명||'대법원')}/${encodeURIComponent(caseNum)}`,
+      });
+      seenNums.add(caseNum);
+      if (cases.length % 50 === 0) console.log(`  수집중: ${cases.length}건...`);
+    }
+    page++;
+    if (page % 10 === 0) console.log(`  페이지 ${page} 처리중...`);
+    await new Promise(r => setTimeout(r, 400));
+  }
+
+  cases.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+  // plain JSON 업로드 (gzip 아님)
+  await s3.send(new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET, Key: 'prec/plenary.json',
+    Body: JSON.stringify({ list: cases, lastUpdated: todayStr, updatedAt: Date.now() }),
+    ContentType: 'application/json',
+    CacheControl: 'public, s-maxage=3600, stale-while-revalidate=600',
+  }));
+  console.log(`\n전원합의체 수집 완료: ${cases.length}건`);
+  return { count: cases.length };
+}
+
+/* ══════════════════════════════════════
+   메인 — 4종 전체 수집 + R2 업로드
    ══════════════════════════════════════ */
 async function main() {
   console.log('[전체 수집 시작]', new Date().toISOString());
@@ -217,18 +292,22 @@ async function main() {
   await uploadGzip('admrul/v1/db.json', { version: 1, updated: Date.now(), count: admrul.count, db: admrul.db });
   await uploadGzip('admrul/v1/meta.json', { lastUpdated: todayStr, count: admrul.count, updatedAt: Date.now(), addedToday: 0 });
 
-  // 4. 통합 meta 업로드
+  // 4. 전원합의체 수집 (plain JSON)
+  const plenary = await collectPlenary(todayStr);
+
+  // 5. 통합 meta 업로드
   await uploadGzip('all/v1/meta.json', {
     lastUpdated: todayStr, updatedAt: Date.now(),
-    prec: prec.count, law: law.count, admrul: admrul.count,
+    prec: prec.count, law: law.count, admrul: admrul.count, plenary: plenary.count,
     total: prec.count + law.count + admrul.count,
   });
 
-  console.log(`\n🎉 전체 DB 완성`);
-  console.log(`  판례:     ${prec.count.toLocaleString()}건`);
-  console.log(`  법령:     ${law.count.toLocaleString()}건`);
-  console.log(`  행정규칙: ${admrul.count.toLocaleString()}건`);
-  console.log(`  총계:     ${(prec.count + law.count + admrul.count).toLocaleString()}건`);
+  console.log('\n🎉 전체 DB 완성');
+  console.log(`  판례:       ${prec.count.toLocaleString()}건`);
+  console.log(`  법령:       ${law.count.toLocaleString()}건`);
+  console.log(`  행정규칙:   ${admrul.count.toLocaleString()}건`);
+  console.log(`  전원합의체: ${plenary.count}건`);
+  console.log(`  총계:       ${(prec.count + law.count + admrul.count).toLocaleString()}건`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
