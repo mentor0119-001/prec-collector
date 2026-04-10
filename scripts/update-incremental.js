@@ -188,8 +188,8 @@ async function updateAdmrul(toDate) {
 
 /* ══════════════════════════════════════
    4. 전원합의체 판결 증분 수집
-   - lastUpdated 없으면: 전체 역사 스캔 (최초 실행 — 수십년 분량 수집)
-   - lastUpdated 있으면: 해당 날짜 이후만 스캔 (일별 증분 — 수 페이지)
+   - lastUpdated 있으면: 해당 날짜 이후만 스캔 (일별 증분 — 빠름)
+   - lastUpdated 없으면: 스킵 (초기수집은 collect-plenary.yml 워크플로우로 별도 실행)
    ══════════════════════════════════════ */
 async function updatePlenary(toDate) {
   console.log('\n── 전원합의체 판결 증분 수집 ──');
@@ -200,15 +200,20 @@ async function updatePlenary(toDate) {
     const res = await s3.send(new GetObjectCommand({ Bucket: process.env.R2_BUCKET, Key: 'prec/plenary.json' }));
     const buf = Buffer.from(await res.Body.transformToByteArray());
     existing = JSON.parse(buf.toString('utf-8'));
-  } catch { /* 없으면 빈 목록 — 전체 스캔 */ }
+  } catch { /* 없으면 빈 목록 */ }
   const existingNums = new Set((existing.list || []).map(p => p.caseNum));
   const lastDate = existing.lastUpdated || null;
-  console.log(`  기존: ${existingNums.size}건, lastUpdated: ${lastDate || '없음(전체스캔)'}`);
+  console.log(`  기존: ${existingNums.size}건, lastUpdated: ${lastDate || '없음'}`);
 
-  // 날짜 필터: lastUpdated 있으면 증분, 없으면 전체 역사 스캔
-  const dateFilter = lastDate ? `&prncYd=${lastDate}~${toDate}` : '';
-  if (dateFilter) console.log(`  날짜필터: ${lastDate}~${toDate}`);
-  else console.log(`  날짜필터 없음 — 전기간 스캔 (수백 페이지 소요)`);
+  // lastUpdated 없으면 증분 스캔 불가 — collect-plenary.yml 워크플로우로 초기수집 필요
+  if (!lastDate) {
+    console.log('  ⚠ lastUpdated 없음 — 초기수집 미완료. collect-plenary.yml 워크플로우를 먼저 실행하세요.');
+    return { count: existingNums.size, added: 0 };
+  }
+
+  // 날짜 필터: lastUpdated 이후 신규만 스캔
+  const dateFilter = `&prncYd=${lastDate}~${toDate}`;
+  console.log(`  날짜필터: ${lastDate}~${toDate}`);
 
   // 법제처 전문검색 — "전원합의체" 포함 대법원 판결
   const ENC_QUERY = encodeURIComponent('전원합의체');
