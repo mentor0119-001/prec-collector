@@ -1,0 +1,49 @@
+name: 판례 summary 백필 수집
+
+# 기존 140K 판례 중 prec/summary/ 에 없는 건을 청크 단위로 수집
+# 수동 실행 전용 — 법제처 rate limit 고려 (일 ~10K 호출)
+# 전체 완료까지 예상: 청크 2500 × 56회 ≈ 2개월 (하루 1~2회 수동 트리거)
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunk:
+        description: '한 번 실행 시 처리할 건수 (기본 2500)'
+        required: true
+        default: '2500'
+        type: string
+
+jobs:
+  backfill-summaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # 2500건 × 350ms ≈ 15분 + lawSearch/upload 오버헤드
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: summary 백필 실행
+        run: node scripts/backfill-summaries.js --chunk=${{ github.event.inputs.chunk || '2500' }}
+        env:
+          LAW_OC_KEY:    ${{ secrets.LAW_OC_KEY }}
+          R2_ENDPOINT:   ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET:     ${{ secrets.R2_BUCKET }}
+
+      - name: 실행 결과 요약
+        if: always()
+        run: |
+          echo "## summary 백필 결과" >> $GITHUB_STEP_SUMMARY
+          echo "- 실행 시각: $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- 청크 크기: ${{ github.event.inputs.chunk || '2500' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 상태: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
