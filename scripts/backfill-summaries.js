@@ -121,7 +121,7 @@ async function main() {
 
   // [4/4] 청크 처리 — 사건번호별 lawSearch → lawService → R2 PUT
   console.log('\n[4/4] summary 수집 실행...');
-  let ok = 0, fail = 0, noHit = 0;
+  let ok = 0, fail = 0, noHit = 0, skip = 0;
   const startMs = Date.now();
 
   for (const caseNum of chunk) {
@@ -143,7 +143,10 @@ async function main() {
       const d = detail?.PrecService;
       if (!d) { fail++; continue; }
 
-      // 4-c. R2 업로드
+      // 4-c. 판시사항·판결요지 둘 다 비어있으면 스킵 (BM25 인덱스 오염 방지)
+      if (!(d.판시사항 || '').trim() && !(d.판결요지 || '').trim()) { skip++; continue; }
+
+      // 4-d. R2 업로드
       const payload = buildSummaryPayload(caseNum, d);
       await s3.send(new PutObjectCommand({
         Bucket:       process.env.R2_BUCKET,
@@ -166,8 +169,8 @@ async function main() {
   }
 
   const totalSec = ((Date.now() - startMs) / 1000).toFixed(0);
-  console.log(`\n[backfill 완료] 성공 ${ok.toLocaleString()} / 실패 ${fail.toLocaleString()} / 미조회 ${noHit.toLocaleString()} (${totalSec}s)`);
-  console.log(`  다음 실행 시 남은 건수 (추정): ${(missing.length - ok).toLocaleString()}`);
+  console.log(`\n[backfill 완료] 성공 ${ok.toLocaleString()} / 실패 ${fail.toLocaleString()} / 미조회 ${noHit.toLocaleString()} / 빈요지 스킵 ${skip.toLocaleString()} (${totalSec}s)`);
+  console.log(`  다음 실행 시 남은 건수 (추정): ${(missing.length - ok - skip).toLocaleString()}`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
