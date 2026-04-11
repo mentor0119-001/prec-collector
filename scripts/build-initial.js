@@ -64,6 +64,7 @@ function courtToId(name) {
 async function collectPrec() {
   console.log('\n═══ 판례 수집 시작 ═══');
   const db = {};
+  const summaryQueue = [];  // [v2.0 M1] 상세 조회 큐 (RAG summary 수집)
   const ranges = [
     '19480101~19991231', '20000101~20091231',
     '20100101~20151231', '20160101~20191231',
@@ -84,10 +85,10 @@ async function collectPrec() {
 
       for (const p of hits) {
         const key = p.사건번호?.replace(/\s+/g, '');
-        if (key) {
-          const dateNum = parseInt((p.선고일자 || '').replace(/\./g, ''), 10) || 0;
-          db[key] = [dateNum, courtToId(p.법원명 || '')];
-        }
+        if (!key) continue;
+        const dateNum = parseInt((p.선고일자 || '').replace(/\./g, ''), 10) || 0;
+        db[key] = [dateNum, courtToId(p.법원명 || '')];
+        if (p.판례일련번호) summaryQueue.push({ key, serialId: p.판례일련번호 });
       }
       const total = Object.keys(db).length;
       console.log(`  p.${page}: +${hits.length} (누계 ${total.toLocaleString()})`);
@@ -98,7 +99,74 @@ async function collectPrec() {
 
   const count = Object.keys(db).length;
   console.log(`\n판례 수집 완료: ${count.toLocaleString()}건`);
+
+  // [v2.0 M1] 상세 조회 + summary 업로드 (rate limit 준수)
+  await collectSummaries(summaryQueue);
+
   return { db, count };
+}
+
+/* ══════════════════════════════════════
+   [v2.0 M1] 판례 summary 수집 — RAG 파이프라인 Phase 1
+   Design §5.1 준수 · collectPlenary()의 lawService.do 패턴 재사용
+   ══════════════════════════════════════ */
+function parseLaws(rawRef) {
+  return (rawRef || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .split(/[,、\n]+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 1)
+    .slice(0, 20);
+}
+
+function parseCaseNums(rawRef) {
+  return (rawRef || '').match(/\b(19|20)\d{2}[가-힣]{1,3}\d+\b/g) || [];
+}
+
+function buildSummaryPayload(key, d) {
+  return {
+    caseNum:  key,
+    title:    d.사건명 || '',
+    caseType: d.사건종류명 || '',
+    issue:    (d.판시사항 || '').slice(0, 2000),
+    summary:  (d.판결요지 || '').slice(0, 2000),
+    laws:     parseLaws(d.참조조문 || ''),
+    refs:     parseCaseNums(d.참조판례 || ''),
+    changed:  /변경|파기|종전.*변경|판례.*변경/.test(d.판례내용 || ''),
+    date:     (d.선고일자 || '').replace(/\./g, ''),
+    court:    d.법원명 || '',
+  };
+}
+
+async function collectSummaries(queue) {
+  if (!queue.length) { console.log('\n[summary 수집] 대상 없음'); return; }
+  console.log(`\n[summary 수집 시작] ${queue.length.toLocaleString()}건`);
+  let ok = 0, fail = 0;
+  for (const { key, serialId } of queue) {
+    try {
+      const url = `https://www.law.go.kr/DRF/lawService.do`
+        + `?OC=${process.env.LAW_OC_KEY}&target=prec&type=JSON&ID=${serialId}`;
+      const detail = await apiFetch(url);
+      const d = detail?.PrecService;
+      if (!d) { fail++; continue; }
+
+      const payload = buildSummaryPayload(key, d);
+      await s3.send(new PutObjectCommand({
+        Bucket:       process.env.R2_BUCKET,
+        Key:          `prec/summary/${key}.json`,
+        Body:         JSON.stringify(payload),
+        ContentType:  'application/json',
+        CacheControl: 'public, s-maxage=86400, stale-while-revalidate=3600',
+      }));
+      ok++;
+      if (ok % 100 === 0) console.log(`  진행: ${ok}/${queue.length}`);
+    } catch (e) {
+      fail++;
+      if (fail <= 20) console.log(`  실패 ${key}: ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, 300));  // rate limit (초당 ~3건)
+  }
+  console.log(`[summary 수집 완료] 성공 ${ok.toLocaleString()} / 실패 ${fail.toLocaleString()}`);
 }
 
 /* ══════════════════════════════════════
