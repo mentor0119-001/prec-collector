@@ -5,6 +5,12 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { gzipSync } from 'zlib';
 
+// [M2-fix] --skip-summaries: 스키마 마이그레이션 전용 모드 (summary 수집 생략)
+const SKIP_SUMMARIES = process.argv.includes('--skip-summaries');
+if (SKIP_SUMMARIES) {
+  console.log('⚠ --skip-summaries: summary 수집 생략 (스키마 마이그레이션 전용 모드)');
+}
+
 const s3 = new S3Client({
   region: 'auto',
   endpoint: process.env.R2_ENDPOINT,
@@ -87,8 +93,10 @@ async function collectPrec() {
         const key = p.사건번호?.replace(/\s+/g, '');
         if (!key) continue;
         const dateNum = parseInt((p.선고일자 || '').replace(/\./g, ''), 10) || 0;
-        db[key] = [dateNum, courtToId(p.법원명 || '')];
-        if (p.판례일련번호) summaryQueue.push({ key, serialId: p.판례일련번호 });
+        // [M2-fix] db 스키마 3필드 확장: [dateNum, courtId, serialId]
+        const serialId = parseInt(p.판례일련번호 || '0', 10) || 0;
+        db[key] = [dateNum, courtToId(p.법원명 || ''), serialId];
+        if (serialId) summaryQueue.push({ key, serialId });
       }
       const total = Object.keys(db).length;
       console.log(`  p.${page}: +${hits.length} (누계 ${total.toLocaleString()})`);
@@ -101,7 +109,12 @@ async function collectPrec() {
   console.log(`\n판례 수집 완료: ${count.toLocaleString()}건`);
 
   // [v2.0 M1] 상세 조회 + summary 업로드 (rate limit 준수)
-  await collectSummaries(summaryQueue);
+  // [M2-fix] --skip-summaries 플래그 시 생략 (스키마 마이그레이션 전용)
+  if (!SKIP_SUMMARIES) {
+    await collectSummaries(summaryQueue);
+  } else {
+    console.log(`\n[summary 수집 생략] 큐 ${summaryQueue.length.toLocaleString()}건 — backfill-summaries.js로 별도 수집`);
+  }
 
   return { db, count };
 }

@@ -18,14 +18,15 @@ on:
         default: 'prec-only'
         type: choice
         options:
-          - prec-only   # 판례 + 전원합의체 증분만 (빠름, ~5분)
-          - full-daily  # 판례 + 법령 + 행정규칙 + 전원합의체 (하루 1회용, ~30분)
-          - rebuild     # 전체 DB 재구축 (build-initial.js, 수시간)
+          - prec-only       # 판례 + 전원합의체 증분만 (빠름, ~5분)
+          - full-daily      # 판례 + 법령 + 행정규칙 + 전원합의체 (하루 1회용, ~30분)
+          - rebuild         # 전체 DB 재구축 (build-initial.js, 수시간)
+          - rebuild-schema  # [M2-fix] db.json 스키마 마이그레이션 전용 (summary 생략, ~2시간)
 
 jobs:
   update-prec-db:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180   # [M2-fix] rebuild-schema 대비 상향 (기존 90)
 
     steps:
       - name: Checkout
@@ -61,6 +62,9 @@ jobs:
           if [ "$MODE" = "rebuild" ]; then
             echo "전체 DB 재구축 시작"
             node scripts/build-initial.js
+          elif [ "$MODE" = "rebuild-schema" ]; then
+            echo "[M2-fix] db.json 스키마 마이그레이션 시작 (summary 수집 생략)"
+            node scripts/build-initial.js --skip-summaries
           elif [ "$MODE" = "full-daily" ]; then
             echo "일별 전체 수집 시작 (판례+법령+행정규칙+전원합의체)"
             node scripts/update-incremental.js --full-daily

@@ -91,8 +91,14 @@ async function updatePrec(toDate) {
     for (const p of hits) {
       const key = p.사건번호?.replace(/\s+/g, '');
       if (!key) continue;
-      newEntries[key] = [parseInt((p.선고일자||'').replace(/\./g,''),10)||0, courtToId(p.법원명||'')];
-      if (p.판례일련번호) summaryQueue.push({ key, serialId: p.판례일련번호 });
+      // [M2-fix] db 스키마 3필드 확장: [dateNum, courtId, serialId]
+      const serialId = parseInt(p.판례일련번호 || '0', 10) || 0;
+      newEntries[key] = [
+        parseInt((p.선고일자||'').replace(/\./g,''),10)||0,
+        courtToId(p.법원명||''),
+        serialId,
+      ];
+      if (serialId) summaryQueue.push({ key, serialId });
     }
     console.log(`  p.${page}: +${hits.length}건`);
     page++;

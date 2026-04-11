@@ -105,9 +105,18 @@ async function main() {
   console.log(`  기존 summary: ${existing.size.toLocaleString()}건 (페이지 ${listPages})`);
 
   // [3/4] 미존재분 선별 → 청크
+  // [M2-fix] 레거시 2필드 엔트리(serialId 없음) 사전 필터링
   console.log('\n[3/4] 미존재분 선별...');
-  const missing = allCaseNums.filter(k => !existing.has(k));
+  const missing = allCaseNums.filter(k => {
+    if (existing.has(k)) return false;
+    const e = dbJson.db[k];
+    return Array.isArray(e) && e.length >= 3 && e[2] > 0;
+  });
+  const legacyCount = allCaseNums.length - existing.size - missing.length;
   console.log(`  미존재: ${missing.length.toLocaleString()}건`);
+  if (legacyCount > 0) {
+    console.log(`  ⚠ 레거시 2필드 엔트리 (serialId 없음): ${legacyCount.toLocaleString()}건 — rebuild-schema 필요`);
+  }
 
   if (missing.length === 0) {
     console.log('\n[완료] 모든 판례의 summary가 존재합니다. 추가 수집 불필요.');
@@ -126,19 +135,14 @@ async function main() {
 
   for (const caseNum of chunk) {
     try {
-      // 4-a. 사건번호로 lawSearch → 판례일련번호 획득
-      const searchUrl = `https://www.law.go.kr/DRF/lawSearch.do`
-        + `?OC=${process.env.LAW_OC_KEY}&target=prec&type=JSON`
-        + `&search=1&query=${encodeURIComponent(caseNum)}`;
-      const search = await apiFetch(searchUrl);
-      const raw    = search?.PrecSearch?.prec;
-      const hits   = !raw ? [] : Array.isArray(raw) ? raw : [raw];
-      const hit    = hits.find(p => p.사건번호?.replace(/\s+/g, '') === caseNum);
-      if (!hit?.판례일련번호) { noHit++; continue; }
+      // [M2-fix] 4-a. db.json에서 serialId 직접 조회 (lawSearch 역조회 제거)
+      const entry = dbJson.db[caseNum];
+      const serialId = entry?.[2];  // [dateNum, courtId, serialId]
+      if (!serialId) { noHit++; continue; }  // 사전 필터링을 통과했지만 방어 코드
 
       // 4-b. lawService.do 상세 조회
       const detailUrl = `https://www.law.go.kr/DRF/lawService.do`
-        + `?OC=${process.env.LAW_OC_KEY}&target=prec&type=JSON&ID=${hit.판례일련번호}`;
+        + `?OC=${process.env.LAW_OC_KEY}&target=prec&type=JSON&ID=${serialId}`;
       const detail = await apiFetch(detailUrl);
       const d = detail?.PrecService;
       if (!d) { fail++; continue; }
@@ -169,7 +173,7 @@ async function main() {
   }
 
   const totalSec = ((Date.now() - startMs) / 1000).toFixed(0);
-  console.log(`\n[backfill 완료] 성공 ${ok.toLocaleString()} / 실패 ${fail.toLocaleString()} / 미조회 ${noHit.toLocaleString()} / 빈요지 스킵 ${skip.toLocaleString()} (${totalSec}s)`);
+  console.log(`\n[backfill 완료] 성공 ${ok.toLocaleString()} / 실패 ${fail.toLocaleString()} / 레거시(serialId 없음) ${noHit.toLocaleString()} / 빈요지 스킵 ${skip.toLocaleString()} (${totalSec}s)`);
   console.log(`  다음 실행 시 남은 건수 (추정): ${(missing.length - ok - skip).toLocaleString()}`);
 }
 
